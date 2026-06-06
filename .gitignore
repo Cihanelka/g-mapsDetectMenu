@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Venv
+venv/
+.venv/
+env/
+
+# Ortam değişkenleri
+.env
+
+# Chrome profili (oturum bilgisi)
+chrome_scraper_profile/
+
+# Loglar
+logs/
+
+# İndirilen görseller
+images/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Geçmiş dosyası
+query_history.json
