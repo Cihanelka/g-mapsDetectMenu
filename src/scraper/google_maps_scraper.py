@@ -22,7 +22,13 @@ import time
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 from config.settings import DEFAULT_TIMEOUT, CHROME_PROFILE_DIR
-from src.scraper.browser_config import _PROFILE_LOCK, _STEALTH_INIT_SCRIPT, _CONTEXT_KWARGS, COMMON_LAUNCH_ARGS
+from src.scraper.browser_config import (
+    _PROFILE_LOCK,
+    _STEALTH_INIT_SCRIPT,
+    _CONTEXT_KWARGS,
+    COMMON_LAUNCH_ARGS,
+    PERSISTENT_CONTEXT_KWARGS,
+)
 from src.scraper.menu_link_extractor import get_all_menu_links
 from src.scraper.menu_photo_extract import extractMenuFromPhotos
 from src.utils.scraper_utils import clickCookieIfAny, cleanText, safeText, safeAttr, safeHref
@@ -85,8 +91,8 @@ async def _extractMapsData(page, url: str, attemptLabel: str) -> dict:
 
         # Yönlendirme kontrolü
         currentUrl = page.url
-        if "google.com/maps" not in currentUrl:
-            _log.warning(f"[{attemptLabel}] Yönlendirme tespit edildi, geri dönülüyor...")
+        if "google.com/maps" not in currentUrl and "maps.app.goo.gl" not in currentUrl:
+            _log.warning(f"[{attemptLabel}] Yönlendirme tespit edildi: {currentUrl}")
             await page.goto(url, timeout=DEFAULT_TIMEOUT, wait_until="domcontentloaded")
             await page.wait_for_timeout(random.randint(4000, 6000))
             await clickCookieIfAny(page)
@@ -102,6 +108,11 @@ async def _extractMapsData(page, url: str, attemptLabel: str) -> dict:
             await page.wait_for_load_state("networkidle", timeout=8000)
         except Exception:
             pass
+
+        try:
+            await page.wait_for_selector("h1, canvas, #scene", timeout=15000, state="visible")
+        except Exception:
+            _log.warning(f"[{attemptLabel}] Maps render beklemesi zaman aşımı — url={page.url}")
 
         # ── Mekan adı ──
         try:
@@ -255,32 +266,14 @@ async def _runGoogleMapsPipeline(url: str, entryId: str = "") -> dict:
         with _PROFILE_LOCK:
             _log.debug(f"Profil kullanılıyor: {chromeProfile}")
             p = await async_playwright().start()
-            try:
-                ctx = await p.chromium.launch_persistent_context(
-                    user_data_dir=chromeProfile,
-                    channel="chrome",
-                    headless=True,
-                    args=COMMON_LAUNCH_ARGS,
-                    ignore_default_args=["--enable-automation"],
-                    viewport={"width": 1440, "height": 900},
-                    locale="tr-TR",
-                    timezone_id="Europe/Istanbul",
-                    extra_http_headers={"Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7"},
-                )
-            except Exception:
-                ctx = await p.chromium.launch_persistent_context(
-                    user_data_dir=chromeProfile,
-                    headless=True,
-                    args=COMMON_LAUNCH_ARGS,
-                    ignore_default_args=["--enable-automation"],
-                    viewport={"width": 1440, "height": 900},
-                    locale="tr-TR",
-                    timezone_id="Europe/Istanbul",
-                    extra_http_headers={"Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7"},
-                )
+            ctx = await p.chromium.launch_persistent_context(
+                user_data_dir=chromeProfile,
+                **PERSISTENT_CONTEXT_KWARGS,
+            )
 
             await ctx.add_init_script(_STEALTH_INIT_SCRIPT)
             mapsPage = await ctx.new_page()
+            await _warmUpGoogleSession(mapsPage)
 
             async def cleanupProfil():
                 try:
@@ -347,7 +340,11 @@ async def _runGoogleMapsPipeline(url: str, entryId: str = "") -> dict:
                 _log.info("[1.3] Adım 1.1 browser oturumu (cookie) yeniden kullanılıyor — Maps'e gidiliyor...")
                 await mapsPage.goto(url, timeout=20000, wait_until="domcontentloaded")
                 await mapsPage.wait_for_timeout(3000)
-                photoMenus = await extractMenuFromPhotos(mapsPage, result["mekan_adi"], entryId)
+                photoMenus = await extractMenuFromPhotos(
+                    mapsPage,
+                    result["mekan_adi"],
+                    entryId,
+                )
                 if photoMenus:
                     result["menu_linkleri"] = photoMenus
                     result["menu_linki"] = photoMenus[0]
@@ -403,6 +400,20 @@ def getMenuDataSync(url: str, entryId: str = "") -> dict:
 
 # ── TOPLU SCRAPE ─────────────────────────────────────────────────────────────
 
+def _chunkUrlList(urls: list[str], batch_size: int) -> list[list[str]]:
+    """URL listesini batch_size boyutunda parçalara ayırır."""
+    return [urls[i:i + batch_size] for i in range(0, len(urls), batch_size)]
+
+
+async def _resetChromeSessionAfterBatch() -> None:
+    """Her paralel worker batch'inden sonra Chrome profilini sıfırlar ve yeniden ısıtır."""
+    from setup_session import setup_chrome_profile
+
+    _log.info("[BulkMaps] Batch tamamlandı — oturum sıfırlanıyor (setup_session --reset)...")
+    await setup_chrome_profile(reset=True)
+    _log.info("[BulkMaps] Oturum sıfırlandı — sonraki batch'e geçiliyor")
+
+
 async def _bulkMapsScrape(urls: list, onComplete, poolSize: int, idMap: dict) -> None:
     """
     Paralel sekme havuzu ile toplu Maps menü arama.
@@ -411,28 +422,17 @@ async def _bulkMapsScrape(urls: list, onComplete, poolSize: int, idMap: dict) ->
     chromeProfile = os.path.abspath(CHROME_PROFILE_DIR)
     isProfileExists = os.path.exists(chromeProfile)
 
-    _ARGS = COMMON_LAUNCH_ARGS.copy()
-    _CTX_KW = dict(
-        viewport={"width": 1440, "height": 900},
-        locale="tr-TR",
-        timezone_id="Europe/Istanbul",
-        extra_http_headers={"Accept-Language": "tr-TR,tr;q=0.9"},
-    )
-
     async with async_playwright() as p:
         if isProfileExists:
-            try:
-                ctx = await p.chromium.launch_persistent_context(
-                    user_data_dir=chromeProfile, channel="chrome",
-                    headless=True, args=_ARGS,
-                    ignore_default_args=["--enable-automation"], **_CTX_KW,
-                )
-            except Exception:
-                ctx = await p.chromium.launch_persistent_context(
-                    user_data_dir=chromeProfile, headless=True, args=_ARGS,
-                    ignore_default_args=["--enable-automation"], **_CTX_KW,
-                )
+            ctx = await p.chromium.launch_persistent_context(
+                user_data_dir=chromeProfile,
+                **PERSISTENT_CONTEXT_KWARGS,
+            )
             await ctx.add_init_script(_STEALTH_INIT_SCRIPT)
+
+            warmup_page = await ctx.new_page()
+            await _warmUpGoogleSession(warmup_page)
+            await warmup_page.close()
 
             pool: asyncio.Queue = asyncio.Queue()
             for _ in range(poolSize):
@@ -452,7 +452,11 @@ async def _bulkMapsScrape(urls: list, onComplete, poolSize: int, idMap: dict) ->
                         if mapsData.get("mekan_adi"):
                             await page.goto(targetUrl, timeout=20000, wait_until="domcontentloaded")
                             await page.wait_for_timeout(3000)
-                            photoMenus = await extractMenuFromPhotos(page, mapsData["mekan_adi"], entryId)
+                            photoMenus = await extractMenuFromPhotos(
+                                page,
+                                mapsData["mekan_adi"],
+                                entryId,
+                            )
                             if photoMenus:
                                 mapsData["menu_linkleri"] = photoMenus
                                 mapsData["menu_linki"] = photoMenus[0]
@@ -476,9 +480,9 @@ async def _bulkMapsScrape(urls: list, onComplete, poolSize: int, idMap: dict) ->
 
         else:
             try:
-                browser = await p.chromium.launch(channel="chrome", headless=True, args=_ARGS)
+                browser = await p.chromium.launch(channel="chrome", headless=True, args=COMMON_LAUNCH_ARGS)
             except Exception:
-                browser = await p.chromium.launch(headless=True, args=_ARGS)
+                browser = await p.chromium.launch(headless=True, args=COMMON_LAUNCH_ARGS)
 
             pool: asyncio.Queue = asyncio.Queue()
             anonContexts = []
@@ -508,7 +512,11 @@ async def _bulkMapsScrape(urls: list, onComplete, poolSize: int, idMap: dict) ->
                         if mapsData.get("mekan_adi"):
                             await page.goto(targetUrl, timeout=20000, wait_until="domcontentloaded")
                             await page.wait_for_timeout(3000)
-                            photoMenus = await extractMenuFromPhotos(page, mapsData["mekan_adi"], entryId)
+                            photoMenus = await extractMenuFromPhotos(
+                                page,
+                                mapsData["mekan_adi"],
+                                entryId,
+                            )
                             if photoMenus:
                                 mapsData["menu_linkleri"] = photoMenus
                                 mapsData["menu_linki"] = photoMenus[0]
@@ -533,10 +541,34 @@ async def _bulkMapsScrape(urls: list, onComplete, poolSize: int, idMap: dict) ->
             await browser.close()
 
 
+async def _runBulkMapsInBatches(
+    urls: list[str],
+    onComplete,
+    pool_size: int,
+    id_map: dict,
+    reset_session_between_batches: bool,
+) -> None:
+    """URL'leri pool_size'lık batch'ler halinde işler; profil modunda batch arası oturum sıfırlar."""
+    url_batches = _chunkUrlList(urls, pool_size)
+    total_batches = len(url_batches)
+
+    for batch_index, batch_urls in enumerate(url_batches):
+        _log.info(
+            f"[BulkMaps] Batch {batch_index + 1}/{total_batches} başlıyor — "
+            f"{len(batch_urls)} URL, {pool_size} paralel worker"
+        )
+        await _bulkMapsScrape(batch_urls, onComplete, pool_size, id_map)
+
+        is_last_batch = batch_index >= total_batches - 1
+        if reset_session_between_batches and not is_last_batch:
+            await _resetChromeSessionAfterBatch()
+
+
 def getBulkMenuDataSync(urls: list, onComplete=None, idMap: dict = None) -> None:
     """
     Toplu Maps menü arama — tek Chrome context, paralel sekmeler.
     Her URL tamamlandığında onComplete(url, data, duration) çağrılır.
+    Profil modunda her 8 URL batch'inden sonra oturum setup_session --reset ile sıfırlanır.
 
     Args:
         urls: Google Maps URL listesi
@@ -549,12 +581,17 @@ def getBulkMenuDataSync(urls: list, onComplete=None, idMap: dict = None) -> None
     POOL_SIZE = 8
 
     if isProfileExists:
-        _log.info(f"[BulkMaps] Profil kilidi bekleniyor — {len(urls)} URL, {POOL_SIZE} sekme")
+        _log.info(
+            f"[BulkMaps] Profil kilidi bekleniyor — {len(urls)} URL, "
+            f"{POOL_SIZE} paralel worker, batch arası oturum sıfırlama aktif"
+        )
         with _PROFILE_LOCK:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             try:
-                loop.run_until_complete(_bulkMapsScrape(urls, onComplete, POOL_SIZE, idMap))
+                loop.run_until_complete(
+                    _runBulkMapsInBatches(urls, onComplete, POOL_SIZE, idMap, reset_session_between_batches=True)
+                )
             except Exception as e:
                 _log.error(f"[BulkMaps] Profil hatası: {e}", exc_info=True)
             finally:
@@ -564,6 +601,8 @@ def getBulkMenuDataSync(urls: list, onComplete=None, idMap: dict = None) -> None
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            loop.run_until_complete(_bulkMapsScrape(urls, onComplete, POOL_SIZE, idMap))
+            loop.run_until_complete(
+                _runBulkMapsInBatches(urls, onComplete, POOL_SIZE, idMap, reset_session_between_batches=False)
+            )
         finally:
             loop.close()

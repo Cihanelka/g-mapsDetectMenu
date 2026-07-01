@@ -18,4 +18,4 @@ if __name__ == "__main__":
     _log = setup_logging()
     _log.info("Google Maps Menü Tespiti API Sunucusu Başlatılıyor...")
     host = "0.0.0.0" if sys.platform != "win32" else "127.0.0.1"
-    uvicorn.run("src.api.server:app", host=host, port=8001)
+    uvicorn.run("src.api.server:app", host=host, port=8003)

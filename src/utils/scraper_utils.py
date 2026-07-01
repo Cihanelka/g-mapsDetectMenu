@@ -7,7 +7,7 @@ Subject: URL temizleme, metin temizleme, güvenli Playwright erişim sarmalayıc
 """
 
 import re
-from urllib.parse import urlparse, parse_qs, unquote
+from urllib.parse import parse_qs, unquote, urlparse
 
 
 def normalizeGoogleRedirectUrl(url: str | None) -> str | None:

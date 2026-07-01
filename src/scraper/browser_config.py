@@ -92,3 +92,16 @@ COMMON_LAUNCH_ARGS = [
     "--disable-default-apps",
     "--window-size=1440,900",
 ]
+
+# launch_persistent_context için zorunlu alanlar — user_agent eksikliği Maps'te
+# kısıtlı arayüze (Menü sekmesi yok) yol açar.
+PERSISTENT_CONTEXT_KWARGS = dict(
+    headless=True,
+    args=COMMON_LAUNCH_ARGS,
+    ignore_default_args=["--enable-automation"],
+    viewport=_CONTEXT_KWARGS["viewport"],
+    locale=_CONTEXT_KWARGS["locale"],
+    timezone_id=_CONTEXT_KWARGS["timezone_id"],
+    user_agent=_CONTEXT_KWARGS["user_agent"],
+    extra_http_headers=_CONTEXT_KWARGS["extra_http_headers"],
+)
