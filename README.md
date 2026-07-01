@@ -19,7 +19,8 @@ Bu projenin temel amacı, bir mekanın Google Maps linki verildiğinde:
 ## Özellikler
 
 - 🌐 **Tekli ve Toplu Tarama**: Tek bir Google Maps URL'si veya binlerce satırlık bir Excel listesi üzerinden toplu işlem (Bulk) başlatabilme yeteneği.
-- 📸 **Gelişmiş Fotoğraf Yakalama (XHR Intercept)**: Menü tabındaki fotoğrafların sayfaya yüklenirken arkada dönen JSON isteklerinden parse edilerek tarihlerine göre (Haziran 2025 ve sonrası) filtrelenmesi.
+- 📸 **Gelişmiş Fotoğraf Yakalama (XHR Intercept)**: Menü tabındaki fotoğrafların sayfaya yüklenirken arkada dönen JSON isteklerinden parse edilerek tarihlerine göre (Haziran 2024 ve sonrası) filtrelenmesi. Menü tabı bulunamazsa mekanın genel fotoğraflarına (kapak resmine tıklanarak) düşülür.
+- 💾 **Kalıcı İlerleme Kaydı (Checkpoint)**: Toplu Excel taramasında her sonuç anında diske yazılır; sunucu yarıda kesilirse yeniden başlatıldığında iş otomatik olarak kaldığı yerden devam eder.
 - 🚀 **Asenkron Mimari**: FastAPI ve Playwright'ın asenkron özellikleri sayesinde bloklanmayan, yüksek performanslı yapı.
 - 🗂️ **Excel Dışa Aktarma**: Toplu işlemler sonucunda elde edilen verileri (mekan adı, menü linkleri, kaynak) anında Excel dosyası olarak indirebilme.
 - 📊 **Görev Durumu ve Geçmiş**: Çalışan arka plan görevlerinin (job) durumunu anlık takip edebilme ve son 50 sorgunun geçmişini görebilme.
@@ -62,11 +63,37 @@ Tarayıcınızda `http://127.0.0.1:8001/docs` adresine giderek Swagger UI üzeri
 
 Temel Endpointler:
 - `GET /health` : Sunucu ve Playwright profilinin durumunu kontrol eder.
-- `POST /api/maps-menu` : Tek bir Google Maps URL'sini tarar ve menü sonuçlarını (varsa link, yoksa fotoğraf listesi) döner.
+- `POST /api/maps-menu` : Tek bir Google Maps URL'sini tarar ve menü sonuçlarını (varsa link, yoksa fotoğraf listesi) ve mekanın taranma süresini (`sorgu_suresi_saniye`) döner.
 - `POST /api/maps-menu-bulk/start` : Excel dosyası yükleyerek toplu tarama işlemini başlatır. Excel dosyasında `url` isimli bir sütun bulunması zorunludur.
-- `GET /api/maps-menu-bulk/status/{job_id}` : Toplu tarama işleminin yüzdelik durumunu, bitip bitmediğini ve (bittiyse) sonuçlarını döner.
-- `GET /api/maps-menu-bulk/download/{job_id}?format=excel` : Toplu tarama sonuçlarını JSON veya Excel olarak indirir.
+- `GET /api/maps-menu-bulk/status/{job_id}` : Toplu tarama işleminin yüzdelik durumunu, bitip bitmediğini ve (bittiyse) sonuçlarını döner. Her mekanın sonucu `{id: {"menu": ..., "sorgu_suresi_saniye": ...}}` formatındadır — yani her mekanın kaç saniyede tarandığı da raporlanır.
+- `GET /api/maps-menu-bulk/download/{job_id}?format=excel` : Toplu tarama sonuçlarını JSON veya Excel olarak indirir (her satırda `sorgu_suresi_saniye` sütunu bulunur).
+- `POST /api/maps-menu-bulk/resume/{job_id}` : Yarıda kalmış bir toplu işi checkpoint'ten kaldığı yerden devam ettirir.
 - `GET /api/history` : Uygulama üzerindeki geçmiş sorguları gösterir.
+
+## Docker ile Çalıştırma
+
+Proje, Playwright Chromium'un önceden kurulu geldiği resmi `mcr.microsoft.com/playwright/python:v1.58.0-noble` imajı üzerine kurulur.
+
+```bash
+# Build + çalıştır (arka planda)
+docker compose up -d --build
+
+# Logları takip et
+docker compose logs -f
+
+# Durdur
+docker compose down
+```
+
+Kalıcı olması gereken klasörler (`chrome_scraper_profile/`, `images/`, `logs/`, `jobs/`) `docker-compose.yml` içinde host'a volume olarak bağlanmıştır; container yeniden oluşturulsa bile Chrome oturumu, indirilen görseller, loglar ve toplu iş checkpoint'leri kaybolmaz.
+
+Chrome profili yoksa profil oluşturmak için container içinde tek seferlik çalıştırın:
+
+```bash
+docker compose run --rm google-detect-menu python setup_session.py
+```
+
+Uygulama `http://localhost:8003` üzerinde ayağa kalkar (`/docs` üzerinden Swagger UI).
 
 ## Proje Mimarisi (Klasör Yapısı)
 
@@ -74,6 +101,7 @@ Temel Endpointler:
 googleDetectMenu/
 ├── config/                  # Yapılandırma ve sabit değişkenler
 ├── images/                  # İndirilen menü fotoğrafları buraya kaydedilir
+├── jobs/                    # Toplu iş checkpoint'leri (kalıcı ilerleme kaydı, anlık yazılır)
 ├── logs/                    # Log kayıtları (INFO, DEBUG, vb.)
 ├── src/
 │   ├── api/                 # FastAPI router'ları, state (job) yönetimi ve pydantic şemaları
@@ -85,16 +113,20 @@ googleDetectMenu/
 │   │   ├── browser_config.py      # Playwright tarayıcı ayarları ve optimizasyon
 │   │   ├── google_maps_scraper.py # Ana orkestrasyon, Maps açılışı ve mekan adını çekme
 │   │   ├── menu_link_extractor.py # Adım 1.1: Menü URL linki tespiti
-│   │   └── menu_photo_extract.py  # Adım 1.3: Fotoğraf sekmesine tıklama ve XHR verisi ayıklama
+│   │   └── menu_photo_extract.py  # Adım 1.3: Menü sekmesi (yoksa kapak fotoğrafı) tarama ve XHR verisi ayıklama
 │   └── utils/
 │       └── logger.py        # Gelişmiş günlük kaydı modülü
 ├── main.py                  # Uygulamayı başlatan giriş dosyası
 ├── requirements.txt         # Proje bağımlılıkları
+├── Dockerfile                # Docker imaj tanımı (Playwright Chromium önceden kurulu)
+├── docker-compose.yml        # Docker Compose servis ve volume tanımları
 └── menu_mobilenet_model.h5  # (Legacy/Harici Model) Görsel analizi için model dosyası
 ```
 
 ## Geliştirici Notları ve Uyarılar
 
 - **Asenkron Döngüler:** Windows işletim sisteminde Playwright ile yaşanan Proactor event loop hatalarını önlemek için `main.py` içerisinde özel asenkron yapılandırma (`WindowsProactorEventLoopPolicy`) kullanılmaktadır.
-- **Tarih Kriteri:** Fotoğraf aramalarında eski menüleri saf dışı bırakmak için `src/scraper/menu_photo_extract.py` içerisinde `_MIN_MENU_DATE` sabiti tanımlanmıştır (Minimum Haziran 2025). Gerekirse değiştirilebilir.
-- **Klasör İzinleri:** İndirilen fotoğrafların ve kaydedilen logların sağlıklı yazılabilmesi için uygulamanın çalıştığı dizinde yazma yetkisi bulunmalıdır.
+- **Tarih Kriteri:** Fotoğraf aramalarında eski menüleri saf dışı bırakmak için `src/scraper/menu_photo_extract.py` içerisinde `_MIN_MENU_DATE` sabiti tanımlanmıştır (Minimum Haziran 2024). Gerekirse değiştirilebilir.
+- **Menü Tabı Fallback:** Mekanda "Menü" sekmesi yoksa veya bulunamazsa, `menu_photo_extract.py` otomatik olarak mekanın kapak fotoğrafına tıklayıp genel fotoğraf galerisinde gezinir ve aynı tarih filtresiyle uygun görselleri toplar.
+- **Toplu İş Checkpoint'leri:** `jobs/{job_id}.json` dosyaları her sonuçta güncellenir. Sunucu yeniden başlatıldığında bitmemiş checkpoint'ler otomatik taranır ve devam ettirilir (`POST /api/maps-menu-bulk/resume/{job_id}` ile manuel de tetiklenebilir).
+- **Klasör İzinleri:** İndirilen fotoğrafların, checkpoint'lerin ve kaydedilen logların sağlıklı yazılabilmesi için uygulamanın çalıştığı dizinde yazma yetkisi bulunmalıdır.

@@ -48,10 +48,9 @@ async def _warmUpGoogleSession(page) -> None:
     """
     try:
         _log.info("Google ön ziyareti başlatılıyor (cookie ısınması)...")
-        await page.goto("https://www.google.com", timeout=20000, wait_until="domcontentloaded")
-        await page.wait_for_timeout(random.randint(1500, 2500))
+        await page.goto("https://www.google.com", timeout=15000, wait_until="domcontentloaded")
+        await page.wait_for_timeout(random.randint(600, 1000))
         await clickCookieIfAny(page)
-        await page.wait_for_timeout(random.randint(800, 1200))
         _log.info("Google ön ziyareti tamamlandı")
     except Exception as e:
         _log.warning(f"Google ön ziyareti başarısız (devam ediliyor): {e}")
@@ -85,16 +84,15 @@ async def _extractMapsData(page, url: str, attemptLabel: str) -> dict:
         _log.info(f"[{attemptLabel}] Sayfa yükleniyor: {url}")
         await page.goto(url, timeout=DEFAULT_TIMEOUT, wait_until="domcontentloaded")
 
-        await page.wait_for_timeout(random.randint(4000, 6000))
+        await page.wait_for_timeout(random.randint(1200, 1800))
         await clickCookieIfAny(page)
-        await page.wait_for_timeout(random.randint(500, 800))
 
         # Yönlendirme kontrolü
         currentUrl = page.url
         if "google.com/maps" not in currentUrl and "maps.app.goo.gl" not in currentUrl:
             _log.warning(f"[{attemptLabel}] Yönlendirme tespit edildi: {currentUrl}")
             await page.goto(url, timeout=DEFAULT_TIMEOUT, wait_until="domcontentloaded")
-            await page.wait_for_timeout(random.randint(4000, 6000))
+            await page.wait_for_timeout(random.randint(1200, 1800))
             await clickCookieIfAny(page)
 
         # Minimal fare hareketi (bot tespitini engellemek için)
@@ -102,10 +100,12 @@ async def _extractMapsData(page, url: str, attemptLabel: str) -> dict:
             random.randint(300, 800), random.randint(200, 500),
             steps=random.randint(3, 6),
         )
-        await page.wait_for_timeout(random.randint(200, 400))
 
+        # Maps sayfası sürekli arka plan isteği attığından "networkidle" pratikte
+        # her zaman timeout'a ulaşır — 8s'lik tam bekleme yerine kısa bir üst
+        # sınır ile sadece gerçekten hızlı yüklenen sayfalarda erken çıkış sağlanır.
         try:
-            await page.wait_for_load_state("networkidle", timeout=8000)
+            await page.wait_for_load_state("networkidle", timeout=2500)
         except Exception:
             pass
 
@@ -116,7 +116,7 @@ async def _extractMapsData(page, url: str, attemptLabel: str) -> dict:
 
         # ── Mekan adı ──
         try:
-            await page.wait_for_selector("h1", timeout=10000)
+            await page.wait_for_selector("h1", timeout=8000)
             h1 = page.locator("h1").first
             if await h1.count() > 0 and await h1.is_visible():
                 data["mekan_adi"] = cleanText(await h1.inner_text())
@@ -156,9 +156,9 @@ async def _extractMapsData(page, url: str, attemptLabel: str) -> dict:
                 return false;
             }""")
             _log.debug(f"Scroll sonucu: {scrolled}")
-            await page.wait_for_timeout(random.randint(800, 1200))
+            await page.wait_for_timeout(random.randint(400, 600))
             await page.mouse.wheel(0, 500)
-            await page.wait_for_timeout(random.randint(600, 900))
+            await page.wait_for_timeout(random.randint(300, 500))
         except Exception as scrollErr:
             _log.debug(f"Scroll hatası: {scrollErr}")
 
@@ -273,7 +273,10 @@ async def _runGoogleMapsPipeline(url: str, entryId: str = "") -> dict:
 
             await ctx.add_init_script(_STEALTH_INIT_SCRIPT)
             mapsPage = await ctx.new_page()
-            await _warmUpGoogleSession(mapsPage)
+            # Kalıcı profil zaten Google cookie'lerini diskte taşıyor (setup_session.py
+            # ile ısıtıldı) — her tekli sorguda tekrar google.com'a gidip ısınmaya
+            # gerek yok, bu adım ~5-8 saniyelik gereksiz gecikmeye sebep oluyordu.
+            _log.debug("Kalıcı profil kullanılıyor — Google ön ziyareti atlanıyor")
 
             async def cleanupProfil():
                 try:
@@ -339,7 +342,7 @@ async def _runGoogleMapsPipeline(url: str, entryId: str = "") -> dict:
                 # 1.1'deki oturum (cookie) korunarak aynı page kullanılıyor
                 _log.info("[1.3] Adım 1.1 browser oturumu (cookie) yeniden kullanılıyor — Maps'e gidiliyor...")
                 await mapsPage.goto(url, timeout=20000, wait_until="domcontentloaded")
-                await mapsPage.wait_for_timeout(3000)
+                await mapsPage.wait_for_timeout(1500)
                 photoMenus = await extractMenuFromPhotos(
                     mapsPage,
                     result["mekan_adi"],
@@ -405,13 +408,31 @@ def _chunkUrlList(urls: list[str], batch_size: int) -> list[list[str]]:
     return [urls[i:i + batch_size] for i in range(0, len(urls), batch_size)]
 
 
+_RESET_SESSION_TIMEOUT_SECONDS = 90
+
+
 async def _resetChromeSessionAfterBatch() -> None:
-    """Her paralel worker batch'inden sonra Chrome profilini sıfırlar ve yeniden ısıtır."""
+    """
+    Her paralel worker batch'inden sonra Chrome profilini sıfırlar ve yeniden ısıtır.
+
+    Sıfırlama sırasında bir hata/timeout oluşursa (örn. ağ sorunu, Maps
+    doğrulaması takılması) tüm toplu işi durdurmak yerine sadece loglanır ve
+    mevcut profille bir sonraki batch'e devam edilir — aksi halde tek bir
+    sıfırlama hatası kalan tüm URL'lerin taranmadan kalmasına sebep oluyordu.
+    """
     from setup_session import setup_chrome_profile
 
     _log.info("[BulkMaps] Batch tamamlandı — oturum sıfırlanıyor (setup_session --reset)...")
-    await setup_chrome_profile(reset=True)
-    _log.info("[BulkMaps] Oturum sıfırlandı — sonraki batch'e geçiliyor")
+    try:
+        await asyncio.wait_for(setup_chrome_profile(reset=True), timeout=_RESET_SESSION_TIMEOUT_SECONDS)
+        _log.info("[BulkMaps] Oturum sıfırlandı — sonraki batch'e geçiliyor")
+    except asyncio.TimeoutError:
+        _log.error(
+            f"[BulkMaps] Oturum sıfırlama {_RESET_SESSION_TIMEOUT_SECONDS}s içinde tamamlanamadı — "
+            "mevcut profille devam ediliyor"
+        )
+    except Exception as e:
+        _log.error(f"[BulkMaps] Oturum sıfırlama hatası — mevcut profille devam ediliyor: {e}", exc_info=True)
 
 
 async def _bulkMapsScrape(urls: list, onComplete, poolSize: int, idMap: dict) -> None:
@@ -451,7 +472,7 @@ async def _bulkMapsScrape(urls: list, onComplete, poolSize: int, idMap: dict) ->
                         # Adım 1.3: fotoğraf tarama
                         if mapsData.get("mekan_adi"):
                             await page.goto(targetUrl, timeout=20000, wait_until="domcontentloaded")
-                            await page.wait_for_timeout(3000)
+                            await page.wait_for_timeout(1500)
                             photoMenus = await extractMenuFromPhotos(
                                 page,
                                 mapsData["mekan_adi"],
@@ -477,6 +498,11 @@ async def _bulkMapsScrape(urls: list, onComplete, poolSize: int, idMap: dict) ->
 
             await asyncio.gather(*[processOneUrl(u) for u in urls])
             await ctx.close()
+            # Chromium'un profil klasöründeki SingletonLock'u tam bırakması için
+            # kısa bir bekleme — hemen ardından aynı profille yeni bir
+            # launch_persistent_context (batch sıfırlama veya sonraki batch)
+            # çağrılırsa aksi halde süresiz kilitlenme (freeze) yaşanabiliyordu.
+            await asyncio.sleep(1.5)
 
         else:
             try:
@@ -511,7 +537,7 @@ async def _bulkMapsScrape(urls: list, onComplete, poolSize: int, idMap: dict) ->
                     else:
                         if mapsData.get("mekan_adi"):
                             await page.goto(targetUrl, timeout=20000, wait_until="domcontentloaded")
-                            await page.wait_for_timeout(3000)
+                            await page.wait_for_timeout(1500)
                             photoMenus = await extractMenuFromPhotos(
                                 page,
                                 mapsData["mekan_adi"],
@@ -568,7 +594,7 @@ def getBulkMenuDataSync(urls: list, onComplete=None, idMap: dict = None) -> None
     """
     Toplu Maps menü arama — tek Chrome context, paralel sekmeler.
     Her URL tamamlandığında onComplete(url, data, duration) çağrılır.
-    Profil modunda her 8 URL batch'inden sonra oturum setup_session --reset ile sıfırlanır.
+    Profil modunda her 4 URL batch'inden sonra oturum setup_session --reset ile sıfırlanır.
 
     Args:
         urls: Google Maps URL listesi
@@ -578,7 +604,7 @@ def getBulkMenuDataSync(urls: list, onComplete=None, idMap: dict = None) -> None
     idMap = idMap or {}
     chromeProfile = os.path.abspath(CHROME_PROFILE_DIR)
     isProfileExists = os.path.exists(chromeProfile)
-    POOL_SIZE = 8
+    POOL_SIZE = 4
 
     if isProfileExists:
         _log.info(

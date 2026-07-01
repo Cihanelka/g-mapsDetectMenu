@@ -19,7 +19,7 @@ _log = get_logger("MenuLinkExtractor")
 
 # ── MENÜ LİNKİ ──────────────────────────────────────────────────────────────
 
-async def _verifyLinkAccessible(url: str, timeout: int = 15) -> bool:
+async def _verifyLinkAccessible(url: str, timeout: int = 6) -> bool:
     """
     URL'nin erişilebilir olup olmadığını kontrol eder.
     HTTP HEAD isteği atar, 200 OK veya yönlendirme dönerse True, aksi halde False.
@@ -184,12 +184,21 @@ async def get_all_menu_links(page) -> list[str]:
         menuCandidates = [c for c in candidates if c["score"] > 0]
         _log.info(f"Bulunan menü adayı sayısı: {len(menuCandidates)}")
 
+        resolvedCandidates = [
+            (candidate, resolved)
+            for candidate in menuCandidates
+            if (resolved := _resolveMenuHref(candidate["href"]))
+        ]
+
+        # HTTP doğrulamalarını sıralı yerine paralel çalıştırıyoruz — birden
+        # fazla aday olduğunda her biri için ayrı ayrı 6-15s beklemek, toplam
+        # sorgu süresini büyük ölçüde şişiriyordu.
+        accessibilityResults = await asyncio.gather(
+            *[_verifyLinkAccessible(resolved) for _, resolved in resolvedCandidates]
+        )
+
         validMenus = []
-        for candidate in menuCandidates:
-            resolved = _resolveMenuHref(candidate["href"])
-            if not resolved:
-                continue
-            isAccessible = await _verifyLinkAccessible(resolved)
+        for (candidate, resolved), isAccessible in zip(resolvedCandidates, accessibilityResults):
             if isAccessible:
                 _log.info(f"Menü linki doğrulandı (score={candidate['score']}): {resolved}")
                 validMenus.append(resolved)

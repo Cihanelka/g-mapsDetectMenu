@@ -1,0 +1,17 @@
+# Subject: googleDetectMenu API servisi — kalıcı veriler (profil, görseller,
+#          loglar, toplu iş checkpoint'leri) volume olarak host'a bağlanır.
+# Created by: Mapin Data
+
+services:
+  google-detect-menu:
+    build: .
+    container_name: google-detect-menu
+    ports:
+      - "8003:8003"
+    volumes:
+      - ./chrome_scraper_profile:/app/chrome_scraper_profile
+      - ./images:/app/images
+      - ./logs:/app/logs
+      - ./jobs:/app/jobs
+    restart: unless-stopped
+    shm_size: "1gb"

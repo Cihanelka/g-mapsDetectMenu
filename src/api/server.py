@@ -11,7 +11,7 @@ from fastapi import FastAPI
 from fastapi.responses import RedirectResponse
 from contextlib import asynccontextmanager
 
-from src.api.routes import router
+from src.api.routes import router, resumeAllIncompleteJobs
 from src.utils.logger import get_logger
 
 _log = get_logger("Server")
@@ -23,6 +23,9 @@ async def lifespan(app: FastAPI):
         loop = asyncio.get_event_loop()
         if not isinstance(loop, asyncio.ProactorEventLoop):
             asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
+    await resumeAllIncompleteJobs()
+
     yield
     _log.info("Google Maps Menü Tespiti API Sunucusu Kapatılıyor...")
 
@@ -32,7 +35,7 @@ app = FastAPI(
     description=(
         "Google Maps URL'sinden menü linki veya menü fotoğraflarını çeker.\n\n"
         "**Adım 1.1**: Maps sayfasından menü linki tespit.\n"
-        "**Adım 1.3**: Maps Menü sekmesinden fotoğraf tarama (Haziran 2025+)."
+        "**Adım 1.3**: Maps Menü sekmesinden (yoksa kapak fotoğrafından) fotoğraf tarama (Haziran 2024+)."
     ),
     version="1.0.0",
     lifespan=lifespan,

@@ -38,3 +38,6 @@ Thumbs.db
 
 # Geçmiş dosyası
 query_history.json
+
+# Toplu iş checkpoint'leri (kalıcı ilerleme kayıtları)
+jobs/

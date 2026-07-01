@@ -67,6 +67,7 @@ async def mapsMenuSingle(request: MapsMenuRequest):
       - menu_linki: Menü linki veya ilk fotoğraf URL'si
       - menu_linkleri: Tüm bulunan linkler/fotoğraflar
       - menu_kaynak: "maps" | "maps_photo" | None
+      - sorgu_suresi_saniye: Mekanın taranması kaç saniye sürdü
     """
     urlStr = str(request.url)
     entryId = request.id or ""
@@ -93,12 +94,17 @@ async def mapsMenuSingle(request: MapsMenuRequest):
 
         _log.info(f"Menü tespiti tamamlandı — süre: {duration:.2f}s, kaynak: {result.get('menu_kaynak')}")
 
-        # ID verilmişse {id: menu_linkleri} formatında döndür
+        # ID verilmişse {id: {"menu": ..., "sorgu_suresi_saniye": ...}} formatında döndür
         if entryId:
             menuList = result.get("menu_linkleri") or []
             if result.get("menu_linki") and not menuList:
                 menuList = [result.get("menu_linki")]
-            return {entryId: menuList if len(menuList) > 1 else (menuList[0] if menuList else None)}
+            return {
+                entryId: {
+                    "menu": menuList if len(menuList) > 1 else (menuList[0] if menuList else None),
+                    "sorgu_suresi_saniye": round(duration, 2),
+                }
+            }
 
         return result
 
@@ -160,7 +166,7 @@ async def mapsMenuBulkStart(file: UploadFile = File(...)):
 
         validUrls = [u for u in allUrls if not u.startswith("__bulunmadi_")]
 
-        job = job_state.createJob(len(allUrls), urls=allUrls)
+        job = job_state.createJob(len(allUrls), urls=allUrls, id_map=idMap)
         for placeholder, result in placeholderMap.items():
             job_state.updateJob(job.job_id, placeholder, result, isSuccess=False)
 
@@ -179,6 +185,73 @@ async def mapsMenuBulkStart(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Başlatma hatası: {str(e)}")
+
+
+@router.post("/maps-menu-bulk/resume/{job_id}", tags=["Menü Tespiti"])
+async def mapsMenuBulkResume(job_id: str):
+    """
+    Yarıda kalmış (henüz bitmemiş) bir toplu işi kaldığı yerden devam ettirir.
+    Checkpoint dosyasında zaten sonucu bulunan URL'ler tekrar taranmaz.
+    """
+    resumed = await _resumeBulkJob(job_id)
+    if resumed is None:
+        raise HTTPException(status_code=404, detail="İş bulunamadı veya checkpoint diskte yok.")
+
+    job, remainingUrls = resumed
+    if not remainingUrls:
+        job_state.finishJob(job_id)
+        return {"job_id": job_id, "mesaj": "Tüm URL'ler zaten tamamlanmış, iş bitirildi."}
+
+    return {
+        "job_id": job_id,
+        "toplam": job.toplam,
+        "mesaj": f"{len(remainingUrls)} kalan URL için tarama kaldığı yerden devam ettirildi.",
+    }
+
+
+async def _resumeBulkJob(jobId: str) -> "tuple | None":
+    """
+    Checkpoint'ten işi belleğe geri yükler (bellekte yoksa) ve kalan URL'ler
+    için arka plan taramasını yeniden başlatır.
+
+    Returns:
+        (BulkJob, kalanUrls) veya iş/checkpoint bulunamazsa None.
+    """
+    job = job_state.getJob(jobId)
+    if job is None:
+        checkpoints = job_state.loadIncompleteJobCheckpoints()
+        checkpoint = next((c for c in checkpoints if c.get("job_id") == jobId), None)
+        if checkpoint is None:
+            return None
+        job = job_state.restoreJobFromCheckpoint(checkpoint)
+
+    if job.bitis is not None:
+        return job, []
+
+    remainingUrls = job_state.getRemainingUrls(job)
+    if remainingUrls:
+        asyncio.create_task(_runBulkMapsJob(jobId, remainingUrls, job.id_map))
+        _log.info(f"[Job {jobId}] Devam ettiriliyor — {len(remainingUrls)} kalan URL")
+
+    return job, remainingUrls
+
+
+async def resumeAllIncompleteJobs() -> None:
+    """
+    Sunucu başlangıcında çağrılır: diskte yarıda kalmış (bitis=None) tüm
+    checkpoint'leri bulur ve otomatik olarak kaldığı yerden devam ettirir.
+    """
+    checkpoints = job_state.loadIncompleteJobCheckpoints()
+    if not checkpoints:
+        return
+
+    _log.info(f"[Başlangıç] {len(checkpoints)} yarıda kalmış toplu iş bulundu — otomatik devam ettiriliyor")
+    for checkpoint in checkpoints:
+        jobId = checkpoint.get("job_id")
+        try:
+            await _resumeBulkJob(jobId)
+        except Exception as e:
+            _log.error(f"[Başlangıç] Job {jobId} devam ettirilemedi: {e}", exc_info=True)
 
 
 async def _runBulkMapsJob(jobId: str, urls: list, idMap: dict) -> None:
@@ -215,7 +288,8 @@ async def _runBulkMapsJob(jobId: str, urls: list, idMap: dict) -> None:
 async def mapsMenuBulkStatus(job_id: str):
     """
     Toplu işlemin durumunu ve (bittiyse) sonuçlarını döner.
-    Sonuçlar {id: menu_linki} formatında döner.
+    Sonuçlar {id: {"menu": ..., "sorgu_suresi_saniye": ...}} formatında döner —
+    her mekanın taranması kaç saniye sürdüğü de bu şekilde raporlanır.
     """
     job = job_state.getJob(job_id)
     if not job:
@@ -235,20 +309,22 @@ async def mapsMenuBulkStatus(job_id: str):
             if key.startswith("__bulunmadi_"):
                 entryId = value.get("id")
                 if entryId:
-                    sonuclarIdBazli[entryId] = None
+                    sonuclarIdBazli[entryId] = {"menu": None, "sorgu_suresi_saniye": None}
             else:
                 entryId = value.get("id")
                 menuLinki = value.get("menu_linki")
                 menuLinkleri = value.get("menu_linkleri") or []
+                sureSaniye = value.get("sorgu_suresi_saniye")
                 if entryId:
                     if len(menuLinkleri) > 1:
-                        sonuclarIdBazli[entryId] = menuLinkleri
+                        menuDegeri = menuLinkleri
                     elif len(menuLinkleri) == 1:
-                        sonuclarIdBazli[entryId] = menuLinkleri[0]
+                        menuDegeri = menuLinkleri[0]
                     elif menuLinki:
-                        sonuclarIdBazli[entryId] = menuLinki
+                        menuDegeri = menuLinki
                     else:
-                        sonuclarIdBazli[entryId] = None
+                        menuDegeri = None
+                    sonuclarIdBazli[entryId] = {"menu": menuDegeri, "sorgu_suresi_saniye": sureSaniye}
 
     menuBulunan = 0
     hataDetaylari = {}
@@ -289,7 +365,7 @@ async def mapsMenuBulkDownload(job_id: str, format: str = "json"):
       - format=json  → JSON dosyası (varsayılan)
       - format=excel → Excel (.xlsx) dosyası
 
-    Excel sütunları: id, mekan_adi, menu_linki, menu_linkleri, menu_kaynak, adres
+    Excel sütunları: id, mekan_adi, menu_linki, menu_linkleri, menu_kaynak, adres, sorgu_suresi_saniye
     Resim adları tekli çalışmayla aynı formatta: {id}_{sanitized_url}.jpg
     """
     job = job_state.getJob(job_id)
@@ -309,6 +385,7 @@ async def mapsMenuBulkDownload(job_id: str, format: str = "json"):
                 "menu_linkleri": None,
                 "menu_kaynak": None,
                 "adres": None,
+                "sorgu_suresi_saniye": None,
             })
         else:
             menuLinkleri = value.get("menu_linkleri") or []
@@ -319,6 +396,7 @@ async def mapsMenuBulkDownload(job_id: str, format: str = "json"):
                 "menu_linkleri": ", ".join(menuLinkleri) if menuLinkleri else None,
                 "menu_kaynak": value.get("menu_kaynak"),
                 "adres": value.get("adres"),
+                "sorgu_suresi_saniye": value.get("sorgu_suresi_saniye"),
             })
 
     fmt = format.lower().strip()
@@ -326,7 +404,13 @@ async def mapsMenuBulkDownload(job_id: str, format: str = "json"):
     if fmt == "excel":
         import pandas as pd
 
-        df = pd.DataFrame(rows, columns=["id", "mekan_adi", "menu_linki", "menu_linkleri", "menu_kaynak", "adres"])
+        df = pd.DataFrame(
+            rows,
+            columns=[
+                "id", "mekan_adi", "menu_linki", "menu_linkleri",
+                "menu_kaynak", "adres", "sorgu_suresi_saniye",
+            ],
+        )
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
             df.to_excel(writer, index=False, sheet_name="Sonuclar")

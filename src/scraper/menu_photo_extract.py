@@ -4,7 +4,8 @@ Created by: Mapin Data
 Created at: 2026-04-21
 Subject: Maps'teki Menü butonuna tıklayarak açılan fotoğrafları gezme,
          XHR yanıtlarını intercept etme ve belirlenen tarihten sonraki menüleri bulma.
-         Minimum tarih: Haziran 2025.
+         Minimum tarih: Haziran 2024.
+         Menü sekmesi bulunamazsa mekanın genel fotoğraflarına (kapak resmi) düşer.
 """
 
 import asyncio
@@ -23,8 +24,8 @@ _log = get_logger("MenuPhotoExtract")
 
 _IMAGES_DIR = Path(__file__).resolve().parent.parent.parent / "images"
 
-# Minimum kabul edilebilir tarih: Haziran 2025 (daha gevşetilmiş)
-_MIN_MENU_DATE = datetime(2025, 6, 1)
+# Minimum kabul edilebilir tarih: Haziran 2024 (daha gevşetilmiş)
+_MIN_MENU_DATE = datetime(2024, 6, 1)
 
 
 def _sanitizeUrlToFilename(url: str, photoId: str = "") -> str:
@@ -303,6 +304,88 @@ def _extractPhotoUrlFromXhr(rawData, rawText: str = "") -> Optional[tuple[str, d
     return None
 
 
+_NEXT_PHOTO_BUTTON_SELECTORS = [
+    'button[aria-label*="next" i]',
+    'button[aria-label*="sonraki" i]',
+    'button[aria-label*="ileri" i]',
+    'div[role="button"][aria-label*="next" i]',
+    'button[jsaction*="next"]',
+]
+
+_COVER_PHOTO_SELECTORS = [
+    'button.aoRNLd',
+    'button[jsaction*="heroHeaderImage"]',
+    'div.RZ66Rb button',
+    'div.ZKCDEc img',
+    'button.OaVZ6',
+    'button[aria-label*="Fotoğraf" i]',
+    'button[aria-label*="Photo" i]',
+    'img.aoRNLd',
+    'button[data-photo-index="0"]',
+]
+
+
+async def _clickCoverPhoto(page: Page) -> bool:
+    """
+    Mekanın kapak (kapak resmi/header) fotoğrafına tıklayarak genel fotoğraf
+    galerisini/görüntüleyicisini açar. Menü sekmesi bulunamadığında fallback
+    olarak kullanılır — Adım 1.3'ün "Menü tab'ı bulunamazsa mekanın
+    fotoğraflarında gezilecek" gereksinimi.
+
+    Returns:
+        Tıklama başarılıysa True, kapak fotoğrafı bulunamazsa False.
+    """
+    for selector in _COVER_PHOTO_SELECTORS:
+        try:
+            locator = page.locator(selector).first
+            if await locator.count() > 0 and await locator.is_visible():
+                await locator.click()
+                _log.info(f"[1.3] Kapak fotoğrafına tıklandı (selector: {selector})")
+                return True
+        except Exception:
+            continue
+
+    _log.warning("[1.3] Kapak fotoğrafı bulunamadı — hiçbir selector eşleşmedi")
+    return False
+
+
+_MAX_COVER_PHOTOS_TO_BROWSE = 15
+_MAX_GRID_PHOTOS_TO_BROWSE = 15
+_MAX_CONSECUTIVE_EMPTY_CLICKS = 4
+
+
+async def _browseCoverPhotosWithNextButton(page: Page, photoResults: list) -> None:
+    """
+    Kapak fotoğrafı tıklandığında açılan tam ekran görüntüleyicide "sonraki"
+    butonuna art arda basarak mekanın fotoğraflarını dolaşır. XHR intercept
+    handler'ı zaten çağıran fonksiyon tarafından kaydedilmiş olduğundan,
+    burada sadece gezinme (navigation) yapılır. Art arda yeni fotoğraf
+    gelmeyince (aynı fotoğraflar tekrar ediyorsa) erken sonlandırılır.
+    """
+    consecutiveNoNewResults = 0
+    for _ in range(_MAX_COVER_PHOTOS_TO_BROWSE):
+        resultCountBefore = len(photoResults)
+        clickedNext = False
+        for nextSelector in _NEXT_PHOTO_BUTTON_SELECTORS:
+            try:
+                nextBtn = page.locator(nextSelector).first
+                if await nextBtn.count() > 0 and await nextBtn.is_visible():
+                    await nextBtn.click()
+                    clickedNext = True
+                    await page.wait_for_timeout(600)
+                    break
+            except Exception:
+                continue
+        if not clickedNext:
+            break
+        if len(photoResults) > resultCountBefore:
+            consecutiveNoNewResults = 0
+        else:
+            consecutiveNoNewResults += 1
+            if consecutiveNoNewResults >= _MAX_CONSECUTIVE_EMPTY_CLICKS:
+                break
+
+
 async def _scrapeMenuPhotosFromMaps(page: Page, mekanAdi: str, entryId: str = "") -> Optional[list[dict]]:
     """
     Google Maps sayfasındaki Menü butonuna tıklayarak fotoğrafları gezer.
@@ -377,6 +460,8 @@ async def _scrapeMenuPhotosFromMaps(page: Page, mekanAdi: str, entryId: str = ""
 
         menuButton = None
         matchedSelector = None
+        hasMenuTab = True
+        usingCoverPhotoFallback = False
 
         try:
             allTabs = await page.evaluate("""() => {
@@ -397,8 +482,10 @@ async def _scrapeMenuPhotosFromMaps(page: Page, mekanAdi: str, entryId: str = ""
                 for t in allTabs
             )
             if not hasMenuTab:
-                _log.warning(f"[1.3] Bu mekanın Menü sekmesi yok — tab listesi: {[t.get('text') for t in allTabs]}")
-                return None
+                _log.warning(
+                    f"[1.3] Bu mekanın Menü sekmesi yok — tab listesi: {[t.get('text') for t in allTabs]} "
+                    "— kapak fotoğrafına geçiliyor"
+                )
         except Exception:
             pass
 
@@ -424,56 +511,66 @@ async def _scrapeMenuPhotosFromMaps(page: Page, mekanAdi: str, entryId: str = ""
             'button:has-text("Menu")',
         ]
 
-        for selector in menuTabSelectors:
-            try:
-                locator = page.locator(selector).first
-                if await locator.count() > 0 and await locator.is_visible():
-                    menuButton = locator
-                    matchedSelector = selector
-                    break
-            except Exception:
-                continue
+        if hasMenuTab:
+            for selector in menuTabSelectors:
+                try:
+                    locator = page.locator(selector).first
+                    if await locator.count() > 0 and await locator.is_visible():
+                        menuButton = locator
+                        matchedSelector = selector
+                        break
+                except Exception:
+                    continue
+
+            if not menuButton:
+                _log.warning(f"[1.3] Menü butonu bulunamadı: {mekanAdi} — kapak fotoğrafına geçiliyor")
 
         if not menuButton:
-            _log.warning(f"[1.3] Menü butonu bulunamadı: {mekanAdi}")
-            return None
+            usingCoverPhotoFallback = True
+            coverClicked = await _clickCoverPhoto(page)
+            if not coverClicked:
+                _log.warning(f"[1.3] Kapak fotoğrafı da bulunamadı, mekan fotoğrafları taranamıyor: {mekanAdi}")
+                return None
+            await page.wait_for_timeout(2000)
 
-        try:
-            buttonHtml = await menuButton.evaluate("el => el.outerHTML")
-            _log.debug(f"[1.3] Menü butonu bulundu [{matchedSelector}]: {buttonHtml[:300]}")
-        except Exception:
-            _log.debug(f"[1.3] Menü butonu bulundu [{matchedSelector}]")
+        if not usingCoverPhotoFallback:
+            try:
+                buttonHtml = await menuButton.evaluate("el => el.outerHTML")
+                _log.debug(f"[1.3] Menü butonu bulundu [{matchedSelector}]: {buttonHtml[:300]}")
+            except Exception:
+                _log.debug(f"[1.3] Menü butonu bulundu [{matchedSelector}]")
 
-        await menuButton.click()
-        _log.info("[1.3] Menü butonuna tıklandı, panel açılıyor...")
-        await page.wait_for_timeout(6000)
+            await menuButton.click()
+            _log.info("[1.3] Menü butonuna tıklandı, panel açılıyor...")
+            await page.wait_for_timeout(2500)
 
-        try:
-            selectedLabel = await page.evaluate("""() => {
-                const sel = document.querySelector('[role="tab"][aria-selected="true"]');
-                return sel ? (sel.getAttribute('aria-label') || sel.innerText || '') : '';
-            }""")
-            _log.info(f"[1.3] Tıklama sonrası seçili tab: '{selectedLabel}'")
-            if 'menü' not in selectedLabel.lower() and 'menu' not in selectedLabel.lower():
-                _log.warning(f"[1.3] Menü sekmesi aktif değil — JS ile tıklama deneniyor...")
-                clicked = await page.evaluate("""() => {
-                    const tabs = document.querySelectorAll('[role="tab"]');
-                    for (const tab of tabs) {
-                        const label = (tab.getAttribute('aria-label') || tab.innerText || '').toLowerCase();
-                        if (label.includes('menü') || label.includes('menu')) {
-                            tab.click();
-                            return label;
-                        }
-                    }
-                    return null;
+        if not usingCoverPhotoFallback:
+            try:
+                selectedLabel = await page.evaluate("""() => {
+                    const sel = document.querySelector('[role="tab"][aria-selected="true"]');
+                    return sel ? (sel.getAttribute('aria-label') || sel.innerText || '') : '';
                 }""")
-                if clicked:
-                    _log.info(f"[1.3] JS ile menü tabına tıklandı: '{clicked}'")
-                    await page.wait_for_timeout(5000)
-                else:
-                    _log.warning("[1.3] JS ile de menü tabı bulunamadı")
-        except Exception as tabErr:
-            _log.debug(f"[1.3] Tab doğrulama hatası: {tabErr}")
+                _log.info(f"[1.3] Tıklama sonrası seçili tab: '{selectedLabel}'")
+                if 'menü' not in selectedLabel.lower() and 'menu' not in selectedLabel.lower():
+                    _log.warning("[1.3] Menü sekmesi aktif değil — JS ile tıklama deneniyor...")
+                    clicked = await page.evaluate("""() => {
+                        const tabs = document.querySelectorAll('[role="tab"]');
+                        for (const tab of tabs) {
+                            const label = (tab.getAttribute('aria-label') || tab.innerText || '').toLowerCase();
+                            if (label.includes('menü') || label.includes('menu')) {
+                                tab.click();
+                                return label;
+                            }
+                        }
+                        return null;
+                    }""")
+                    if clicked:
+                        _log.info(f"[1.3] JS ile menü tabına tıklandı: '{clicked}'")
+                        await page.wait_for_timeout(2000)
+                    else:
+                        _log.warning("[1.3] JS ile de menü tabı bulunamadı")
+            except Exception as tabErr:
+                _log.debug(f"[1.3] Tab doğrulama hatası: {tabErr}")
 
         try:
             domDebug = await page.evaluate("""() => {
@@ -532,63 +629,75 @@ async def _scrapeMenuPhotosFromMaps(page: Page, mekanAdi: str, entryId: str = ""
                 continue
 
         if not photos:
-            _log.warning("[1.3] Fotoğraf galerisi bulunamadı — tüm selector'lar denendi")
+            if usingCoverPhotoFallback:
+                # Kapak fotoğrafına tıklandığında genellikle grid değil, doğrudan
+                # tam ekran görüntüleyici açılır — "sonraki" butonuyla gezinerek
+                # mekanın fotoğraflarını tek tek dolaşıyoruz.
+                _log.info("[1.3] Fotoğraf galerisi (grid) yok — tam ekran görüntüleyicide 'sonraki' ile geziliyor")
+                await _browseCoverPhotosWithNextButton(page, photoResults)
+            else:
+                _log.warning("[1.3] Fotoğraf galerisi bulunamadı — tüm selector'lar denendi")
 
-            try:
-                jsElements = await page.evaluate("""() => {
-                    const elements = document.querySelectorAll('.K4UgGe');
-                    return Array.from(elements).map((el, i) => ({
-                        index: i,
-                        tagName: el.tagName,
-                        className: el.className,
-                        hasImg: el.querySelector('img') !== null,
-                        imgSrc: el.querySelector('img')?.src || null,
-                        isVisible: el.offsetParent !== null,
-                    }));
-                }""")
-                _log.info(f"[1.3] JavaScript ile {len(jsElements)} .K4UgGe elementi bulundu")
-            except Exception as jsErr:
-                _log.info(f"[1.3] JavaScript seçim hatası: {jsErr}")
+                try:
+                    jsElements = await page.evaluate("""() => {
+                        const elements = document.querySelectorAll('.K4UgGe');
+                        return Array.from(elements).map((el, i) => ({
+                            index: i,
+                            tagName: el.tagName,
+                            className: el.className,
+                            hasImg: el.querySelector('img') !== null,
+                            imgSrc: el.querySelector('img')?.src || null,
+                            isVisible: el.offsetParent !== null,
+                        }));
+                    }""")
+                    _log.info(f"[1.3] JavaScript ile {len(jsElements)} .K4UgGe elementi bulundu")
+                except Exception as jsErr:
+                    _log.info(f"[1.3] JavaScript seçim hatası: {jsErr}")
 
-            return None
+                if not photoResults:
+                    return None
+        else:
+            # ── Her fotoğrafa tıkla ve XHR yanıtlarını topla ──
+            # Fazla sayıda fotoğrafta tek tek tıklamak süreyi çok uzatıyordu —
+            # üst limitle sınırlandırıp, art arda yeni sonuç gelmeyince erken çıkıyoruz.
+            maxPhotos = min(len(photos), _MAX_GRID_PHOTOS_TO_BROWSE)
+            _log.debug(f"[1.3] {len(photos)} fotoğraftan {maxPhotos} tanesi taranacak...")
 
-        # ── Her fotoğrafa tıkla ve XHR yanıtlarını topla ──
-        maxPhotos = len(photos)
-        _log.debug(f"[1.3] {len(photos)} fotoğraf üzerinde tarama yapılacak...")
-
-        for i, photo in enumerate(photos[:maxPhotos]):
-            try:
-                isVisible = await photo.is_visible()
-                if not isVisible:
-                    _log.debug(f"[1.3] Fotoğraf {i+1} görünür değil, atlanıyor")
-                    continue
-
-                _log.debug(f"[1.3] Fotoğraf {i+1}/{maxPhotos} tıklanıyor...")
-                await photo.click()
-                await page.wait_for_timeout(2000)
-
-                nextButtonSelectors = [
-                    'button[aria-label*="next" i]',
-                    'button[aria-label*="sonraki" i]',
-                    'button[aria-label*="ileri" i]',
-                    'div[role="button"][aria-label*="next" i]',
-                    'button[jsaction*="next"]',
-                ]
-
-                for nextSelector in nextButtonSelectors:
-                    try:
-                        nextBtn = page.locator(nextSelector).first
-                        if await nextBtn.count() > 0 and await nextBtn.is_visible():
-                            await nextBtn.click()
-                            _log.debug("[1.3] Sonraki fotoğrafa geçildi")
-                            await page.wait_for_timeout(1000)
-                            break
-                    except Exception:
+            consecutiveNoNewResults = 0
+            for i, photo in enumerate(photos[:maxPhotos]):
+                resultCountBefore = len(photoResults)
+                try:
+                    isVisible = await photo.is_visible()
+                    if not isVisible:
+                        _log.debug(f"[1.3] Fotoğraf {i+1} görünür değil, atlanıyor")
                         continue
 
-            except Exception as e:
-                _log.debug(f"[1.3] Fotoğraf {i+1} tıklama hatası: {e}")
-                continue
+                    _log.debug(f"[1.3] Fotoğraf {i+1}/{maxPhotos} tıklanıyor...")
+                    await photo.click()
+                    await page.wait_for_timeout(900)
+
+                    for nextSelector in _NEXT_PHOTO_BUTTON_SELECTORS:
+                        try:
+                            nextBtn = page.locator(nextSelector).first
+                            if await nextBtn.count() > 0 and await nextBtn.is_visible():
+                                await nextBtn.click()
+                                _log.debug("[1.3] Sonraki fotoğrafa geçildi")
+                                await page.wait_for_timeout(500)
+                                break
+                        except Exception:
+                            continue
+
+                except Exception as e:
+                    _log.debug(f"[1.3] Fotoğraf {i+1} tıklama hatası: {e}")
+                    continue
+                finally:
+                    if len(photoResults) > resultCountBefore:
+                        consecutiveNoNewResults = 0
+                    else:
+                        consecutiveNoNewResults += 1
+                        if consecutiveNoNewResults >= _MAX_CONSECUTIVE_EMPTY_CLICKS:
+                            _log.debug("[1.3] Art arda yeni fotoğraf gelmedi — tarama erken sonlandırıldı")
+                            break
 
         # ── Sonuçları değerlendir ──
         if not photoResults:
@@ -598,7 +707,7 @@ async def _scrapeMenuPhotosFromMaps(page: Page, mekanAdi: str, entryId: str = ""
         validPhotos = [p for p in photoResults if p["is_valid"]]
 
         if validPhotos:
-            _log.info(f"[1.3] {len(validPhotos)} geçerli menü fotoğrafı bulundu (Haziran 2025+)")
+            _log.info(f"[1.3] {len(validPhotos)} geçerli menü fotoğrafı bulundu (Haziran 2024+)")
             for photo in validPhotos:
                 await _downloadPhotoToImages(photo["url"], entryId)
             validPhotos.sort(key=lambda x: x["date"], reverse=True)
